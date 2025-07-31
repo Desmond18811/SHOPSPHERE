@@ -1,12 +1,10 @@
-import mongoose from "mongoose";
-import Products from "../models/Products.js";
-import Order from "../models/Order.js";
-import Store from "../models/Store.js";
-
-
+import mongoose from 'mongoose';
+import Products from '../models/Products.js';
+import Order from '../models/Order.js';
+import Store from '../models/Store.js';
 import { sendManagerAlert } from '../config/email.js';
 
-export const createOrder = async(req, res) => {
+export const createOrder = async (req, res) => {
     try {
         const { orderItems, shippingInfo, paymentInfo, itemsPrice, taxPrice, shippingPrice, totalPrice } = req.body;
 
@@ -15,14 +13,58 @@ export const createOrder = async(req, res) => {
         for (const field of requiredFields) {
             if (!req.body[field]) {
                 return res.status(400).json({
-                    status: "error",
+                    status: 'error',
                     statusCode: 400,
-                    error: `Missing required field: ${field}`
+                    message: `Missing required field: ${field}`,
                 });
             }
         }
 
-        // Check stock and create order
+        // Validate req.user
+        if (!req.user) {
+            return res.status(401).json({
+                status: 'error',
+                statusCode: 401,
+                message: 'Not authorized, user not found in request',
+            });
+        }
+
+        // Validate orderItems
+        if (!Array.isArray(orderItems) || orderItems.length === 0) {
+            return res.status(400).json({
+                status: 'error',
+                statusCode: 400,
+                message: 'Order items must be a non-empty array',
+            });
+        }
+
+        // Validate products and stock
+        for (const item of orderItems) {
+            if (!mongoose.isValidObjectId(item.product)) {
+                return res.status(400).json({
+                    status: 'error',
+                    statusCode: 400,
+                    message: `Invalid product ID for item: ${item.name}`,
+                });
+            }
+            const product = await Products.findById(item.product);
+            if (!product) {
+                return res.status(404).json({
+                    status: 'error',
+                    statusCode: 404,
+                    message: `Product not found for item: ${item.name}`,
+                });
+            }
+            if (product.stock < item.quantity) {
+                return res.status(400).json({
+                    status: 'error',
+                    statusCode: 400,
+                    message: `Insufficient stock for ${product.name}. Available: ${product.stock}`,
+                });
+            }
+        }
+
+        // Create order
         const order = await Order.create({
             user: req.user.id,
             orderItems,
@@ -32,23 +74,24 @@ export const createOrder = async(req, res) => {
             taxPrice,
             shippingPrice,
             totalPrice,
-            orderStatus: 'Processing'
+            orderStatus: 'Processing',
         });
 
         return res.status(201).json({
-            status: "success",
+            status: 'success',
             statusCode: 201,
             message: 'Order created successfully',
-            data: order
+            data: order,
         });
-    } catch(error) {
+    } catch (error) {
+        console.error('Create order error:', error.message);
         return res.status(500).json({
-            status: "error",
+            status: 'error',
             statusCode: 500,
-            error: error.message
+            message: error.message,
         });
     }
-}
+};
 
 export const getAllOrders = async(req, res) => {
     try {
