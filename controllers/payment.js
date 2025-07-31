@@ -7,47 +7,12 @@ import Payment from '../models/Payment.js';
 import Product from '../models/Products.js';
 import Store from '../models/Store.js';
 import { sendManagerAlert } from '../config/email.js';
+import Paystack from 'paystack-node';
+import {PAYSTACK_WEBHOOK_SECRET} from "../config/env.js"; // Import the main Paystack package
 
 dotenv.config();
 
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
-const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET;
-const baseUrl = 'https://api.paystack.co';
-
-const initializeTransaction = async (email, amount, metadata, callbackUrl) => {
-    try {
-        if (!PAYSTACK_SECRET_KEY) {
-            throw new Error('PAYSTACK_SECRET_KEY is not defined in environment variables');
-        }
-        if (!email || !amount || amount <= 0) {
-            throw new Error(`Invalid parameters: email=${email}, amount=${amount}`);
-        }
-        if (!callbackUrl) {
-            throw new Error('Callback URL is not defined');
-        }
-        const response = await axios.post(
-            `${baseUrl}/transaction/initialize`,
-            {
-                email,
-                amount: Math.round(amount * 100),
-                metadata,
-                callback_url: callbackUrl,
-            },
-            {
-                headers: {
-                    Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-                    'Content-Type': 'application/json',
-                },
-            }
-        );
-        return response.data;
-    } catch (error) {
-        console.error('Paystack initialization error:', error.response?.data || error.message);
-        throw new Error(`Failed to initialize payment: ${error.response?.data?.message || error.message}`);
-    }
-};
-
-// ... (verifyTransaction remains unchanged)
+const paystack = new Paystack(process.env.PAYSTACK_SECRET_KEY);
 
 export const createPayment = async (req, res) => {
     try {
@@ -115,12 +80,12 @@ export const createPayment = async (req, res) => {
 
         console.log('Initializing payment for:', { email: req.user.email, amount: order.totalPrice });
         const callbackUrl = `${process.env.APP_URL}/api/payments/webhook`;
-        const { data } = await initializeTransaction(
-            req.user.email,
-            order.totalPrice,
-            { orderId },
-            callbackUrl
-        );
+        const response = await paystack.transaction.initialize({
+            email: req.user.email,
+            amount: Math.round(order.totalPrice * 100), // Amount in kobo
+            metadata: { orderId },
+            callback_url: callbackUrl,
+        });
 
         const payment = await Payment.create({
             user: req.user.id,
@@ -128,7 +93,7 @@ export const createPayment = async (req, res) => {
             amount: order.totalPrice,
             currency: 'NGN',
             paymentMethod: 'card',
-            transactionReference: data.reference,
+            transactionReference: response.data.reference,
             status: 'pending',
             metadata: { orderItems: order.orderItems, saveCard },
         });
@@ -137,9 +102,9 @@ export const createPayment = async (req, res) => {
             status: 'success',
             message: 'Payment initialized',
             data: {
-                authorizationUrl: data.authorization_url,
-                accessCode: data.access_code,
-                reference: data.reference,
+                authorizationUrl: response.data.authorization_url,
+                accessCode: response.data.access_code,
+                reference: response.data.reference,
                 saveCard: Boolean(saveCard),
             },
         });
@@ -152,8 +117,6 @@ export const createPayment = async (req, res) => {
     }
 };
 
-
-
 export const verifyPayment = async (req, res) => {
     try {
         const { reference } = req.query;
@@ -164,7 +127,7 @@ export const verifyPayment = async (req, res) => {
             });
         }
 
-        const verification = await verifyTransaction(reference);
+        const verification = await paystack.transaction.verify({ reference });
 
         if (verification.data.status !== 'success') {
             return res.status(400).json({
@@ -179,7 +142,7 @@ export const verifyPayment = async (req, res) => {
             {
                 status: 'success',
                 paymentDate: new Date(),
-                authorizationCode: verification.data.authorization?.authorization_code,
+                authorizationCode: verification.data.data.authorization.authorization_code,
                 paymentMethod: 'card',
             },
             { new: true }
@@ -251,62 +214,6 @@ const manageStockAndAlerts = async (order) => {
         }
     }
 };
-
-export const webhook = async (req, res) => {
-    try {
-        // Verify webhook signature
-        const hash = crypto
-            .createHmac('sha512', PAYSTACK_WEBHOOK_SECRET)
-            .update(JSON.stringify(req.body))
-            .digest('hex');
-
-        if (hash !== req.headers['x-paystack-signature']) {
-            console.warn('Invalid webhook signature - possible security breach');
-            return res.status(400).send('Invalid signature');
-        }
-
-        const event = req.body;
-        if (event.event === 'charge.success') {
-            const reference = event.data.reference;
-
-            const payment = await Payment.findOneAndUpdate(
-                { transactionReference: reference },
-                {
-                    status: 'success',
-                    paymentDate: new Date(),
-                    authorizationCode: event.data.authorization?.authorization_code,
-                    paymentMethod: 'card',
-                },
-                { new: true }
-            );
-
-            if (payment) {
-                await Order.findByIdAndUpdate(
-                    payment.order,
-                    {
-                        paymentInfo: {
-                            id: reference,
-                            status: 'success',
-                            reference,
-                        },
-                        orderStatus: 'Processing',
-                        isPaid: true,
-                        paidAt: new Date(),
-                    }
-                );
-            }
-        }
-
-        return res.status(200).send('Webhook processed');
-    } catch (error) {
-        console.error('Webhook processing error:', error);
-        return res.status(500).send('Webhook processing failed');
-    }
-};
-
-
-
-
 
 export const chargeSavedCard = async (req, res, next) => {
     try {
@@ -410,4 +317,321 @@ export const getPaymentHistory = async (req, res, next) => {
         });
     }
 };
+
+export const webhook = async (req, res) => {
+    try {
+        // Verify webhook signature
+        const hash = crypto
+            .createHmac('sha512', PAYSTACK_WEBHOOK_SECRET)
+            .update(JSON.stringify(req.body))
+            .digest('hex');
+
+        if (hash !== req.headers['x-paystack-signature']) {
+            console.warn('Invalid webhook signature - possible security breach');
+            return res.status(400).send('Invalid signature');
+        }
+
+        const event = req.body;
+        if (event.event === 'charge.success') {
+            const reference = event.data.reference;
+
+            const payment = await Payment.findOneAndUpdate(
+                { transactionReference: reference },
+                {
+                    status: 'success',
+                    paymentDate: new Date(),
+                    authorizationCode: event.data.authorization?.authorization_code,
+                    paymentMethod: 'card',
+                },
+                { new: true }
+            );
+
+            if (payment) {
+                await Order.findByIdAndUpdate(
+                    payment.order,
+                    {
+                        paymentInfo: {
+                            id: reference,
+                            status: 'success',
+                            reference,
+                        },
+                        orderStatus: 'Processing',
+                        isPaid: true,
+                        paidAt: new Date(),
+                    }
+                );
+            }
+        }
+
+        return res.status(200).send('Webhook processed');
+    } catch (error) {
+        console.error('Webhook processing error:', error);
+        return res.status(500).send('Webhook processing failed');
+    }
+};
+
+
+
+// ... (other functions like webhook, chargeSavedCard, getPaymentHistory remain unchanged, as provided earlier)
+
+
+
+
+// import axios from 'axios';
+// import dotenv from 'dotenv';
+// import crypto from 'crypto';
+// import mongoose from 'mongoose';
+// import Order from '../models/Order.js';
+// import Payment from '../models/Payment.js';
+// import Product from '../models/Products.js';
+// import Store from '../models/Store.js';
+// import { sendManagerAlert } from '../config/email.js';
+// import {verifyTransaction} from "paystack-node/src/endpoints/transactions.js";
+// import Paystack from 'paystack-node'
+//
+// dotenv.config();
+//
+// const paystack  = new Paystack(process.env.PAYSTACK_SECRET_KEY)
+// //const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+// //const PAYSTACK_WEBHOOK_SECRET = process.env.PAYSTACK_WEBHOOK_SECRET;
+// const baseUrl = 'https://api.paystack.co';
+//
+// const initializeTransaction = async (email, amount, metadata, callbackUrl) => {
+//     try {
+//         if (!PAYSTACK_SECRET_KEY) {
+//             throw new Error('PAYSTACK_SECRET_KEY is not defined in environment variables');
+//         }
+//         if (!email || !amount || amount <= 0) {
+//             throw new Error(`Invalid parameters: email=${email}, amount=${amount}`);
+//         }
+//         if (!callbackUrl) {
+//             throw new Error('Callback URL is not defined');
+//         }
+//         const response = await axios.post(
+//             `${baseUrl}/transaction/initialize`,
+//             {
+//                 email,
+//                 amount: Math.round(amount * 100),
+//                 metadata,
+//                 callback_url: callbackUrl,
+//             },
+//             {
+//                 headers: {
+//                     Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+//                     'Content-Type': 'application/json',
+//                 },
+//             }
+//         );
+//         return response.data;
+//     } catch (error) {
+//         console.error('Paystack initialization error:', error.response?.data || error.message);
+//         throw new Error(`Failed to initialize payment: ${error.response?.data?.message || error.message}`);
+//     }
+// };
+//
+//
+//
+// export const createPayment = async (req, res) => {
+//     try {
+//         const { saveCard } = req.body;
+//         const { orderId } = req.params;
+//
+//         if (!mongoose.isValidObjectId(orderId)) {
+//             return res.status(400).json({
+//                 status: 'error',
+//                 message: 'Invalid order ID',
+//             });
+//         }
+//
+//         if (!req.user) {
+//             return res.status(401).json({
+//                 status: 'error',
+//                 message: 'Not authorized, user not found in request',
+//             });
+//         }
+//
+//         if (!process.env.APP_URL) {
+//             return res.status(500).json({
+//                 status: 'error',
+//                 message: 'APP_URL is not defined in environment variables',
+//             });
+//         }
+//
+//         const order = await Order.findById(orderId);
+//         if (!order) {
+//             return res.status(404).json({
+//                 status: 'error',
+//                 message: 'Order not found',
+//             });
+//         }
+//
+//         if (order.user.toString() !== req.user.id && req.user.role !== 'admin') {
+//             return res.status(403).json({
+//                 status: 'error',
+//                 message: 'Unauthorized to process this payment',
+//             });
+//         }
+//
+//         if (order.orderStatus === 'Cancelled') {
+//             return res.status(400).json({
+//                 status: 'error',
+//                 message: 'Cannot process payment for a cancelled order',
+//             });
+//         }
+//
+//         for (const item of order.orderItems) {
+//             const product = await Product.findById(item.product);
+//             if (!product) {
+//                 return res.status(400).json({
+//                     status: 'error',
+//                     message: `Product not found for item: ${item.name}`,
+//                 });
+//             }
+//             if (product.stock < item.quantity) {
+//                 return res.status(400).json({
+//                     status: 'error',
+//                     message: `Insufficient stock for ${product.name}. Available: ${product.stock}`,
+//                 });
+//             }
+//         }
+//
+//         console.log('Initializing payment for:', { email: req.user.email, amount: order.totalPrice });
+//         const callbackUrl = `${process.env.APP_URL}/api/payments/webhook`;
+//         const { data } = await initializeTransaction(
+//             req.user.email,
+//             order.totalPrice,
+//             { orderId },
+//             callbackUrl
+//         );
+//
+//         const payment = await Payment.create({
+//             user: req.user.id,
+//             order: orderId,
+//             amount: order.totalPrice,
+//             currency: 'NGN',
+//             paymentMethod: 'card',
+//             transactionReference: data.reference,
+//             status: 'pending',
+//             metadata: { orderItems: order.orderItems, saveCard },
+//         });
+//
+//         return res.status(200).json({
+//             status: 'success',
+//             message: 'Payment initialized',
+//             data: {
+//                 authorizationUrl: data.authorization_url,
+//                 accessCode: data.access_code,
+//                 reference: data.reference,
+//                 saveCard: Boolean(saveCard),
+//             },
+//         });
+//     } catch (error) {
+//         console.error('Payment creation error:', error.message);
+//         return res.status(500).json({
+//             status: 'error',
+//             message: error.message || 'Payment initialization failed',
+//         });
+//     }
+// };
+//
+//
+//
+// export const verifyPayment = async (req, res) => {
+//     try {
+//         const { reference } = req.query;
+//         if (!reference) {
+//             return res.status(400).json({
+//                 status: 'error',
+//                 message: 'Payment reference is required',
+//             });
+//         }
+//
+//         const verification = await verifyTransaction(reference);
+//
+//         if (verification.data.status !== 'success') {
+//             return res.status(400).json({
+//                 status: 'error',
+//                 message: 'Payment verification failed',
+//                 data: verification.data,
+//             });
+//         }
+//
+//         const payment = await Payment.findOneAndUpdate(
+//             { transactionReference: reference },
+//             {
+//                 status: 'success',
+//                 paymentDate: new Date(),
+//                 authorizationCode: verification.data.authorization?.authorization_code,
+//                 paymentMethod: 'card',
+//             },
+//             { new: true }
+//         );
+//
+//         if (!payment) {
+//             return res.status(404).json({
+//                 status: 'error',
+//                 message: 'Payment record not found',
+//             });
+//         }
+//
+//         // Update order status
+//         const order = await Order.findByIdAndUpdate(
+//             payment.order,
+//             {
+//                 paymentInfo: {
+//                     id: reference,
+//                     status: 'success',
+//                     reference,
+//                 },
+//                 orderStatus: 'Processing',
+//                 isPaid: true,
+//                 paidAt: new Date(),
+//             },
+//             { new: true }
+//         );
+//
+//         // Stock management and alerts
+//         await manageStockAndAlerts(order);
+//
+//         return res.status(200).json({
+//             status: 'success',
+//             message: 'Payment verified successfully',
+//             data: {
+//                 paymentId: payment._id,
+//                 orderId: payment.order,
+//                 amount: payment.amount,
+//                 status: payment.status,
+//             },
+//         });
+//     } catch (error) {
+//         console.error('Payment verification error:', error);
+//         return res.status(500).json({
+//             status: 'error',
+//             message: error.message || 'Payment verification failed',
+//         });
+//     }
+// };
+//
+// // Helper function for stock management
+// const manageStockAndAlerts = async (order) => {
+//     for (const item of order.orderItems) {
+//         const product = await Product.findById(item.product);
+//         if (product) {
+//             product.stock -= item.quantity;
+//             await product.save();
+//
+//             if (product.stock <= 0) {
+//                 const store = await Store.findById(product.store);
+//                 if (store) {
+//                     await sendManagerAlert({
+//                         email: store.owner,
+//                         subject: 'Product Out of Stock',
+//                         message: `The product "${product.name}" in store "${store.name}" is out of stock.`,
+//                     });
+//                 }
+//             }
+//         }
+//     }
+// };
+//
 
