@@ -15,7 +15,8 @@ import storeRoutes from "./routes/storeRoutes.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import paymentRoutes from "./routes/paymentRoutes.js";
 import cartRoutes from "./routes/cartRoutes.js";
-import connectToDatabase from "./config/db.js"; // Custom error handler (to be created)
+import connectToDatabase from "./config/db.js";
+import deliveryRoutes from "./routes/deliveryRoutes.js";
 
 // Load environment variables
 dotenv.config();
@@ -75,6 +76,7 @@ app.use('/api/stores', storeRoutes)
 app.use('/api/orders', orderRoutes)
 app.use('/api/cart', cartRoutes)
 app.use('/api/payments', paymentRoutes)
+app.use('/api/delivery', deliveryRoutes)
 
 app.use(errorHandler);
 
