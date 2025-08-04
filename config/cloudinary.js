@@ -1,4 +1,4 @@
-import cloudinary from 'cloudinary'; // Import Cloudinary SDK
+import { v2 as cloudinary } from 'cloudinary'; // Changed this line // Import Cloudinary SDK
 import { CloudinaryStorage } from 'multer-storage-cloudinary'; // Import Cloudinary storage for Multer
 import dotenv from 'dotenv'; // Import dotenv to load environment variables
 

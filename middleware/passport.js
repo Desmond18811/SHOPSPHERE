@@ -1,4 +1,4 @@
-import passport from 'passport'
+import passport from 'middleware/passport.js'
 import User from "../models/User.js";
 import {Strategy as LocalStrategy} from "passport-local";
 import {ExtractJwt, Strategy as JwtStrategy} from "passport-jwt";
